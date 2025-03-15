@@ -6,6 +6,7 @@ from streamlit_folium import folium_static
 from pyproj import Transformer
 import io
 import numpy as np
+from shapely.geometry import Polygon
 
 def convert_coordinates(df, from_epsg, to_epsg=4326):
     """Convert coordinates between EPSG systems"""
@@ -37,21 +38,34 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
     y_coords = np.arange(miny, maxy, grid_size_meters)
     
     grid_cells = []
-    for x in x_coords:
-        for y in y_coords:
-            cell = {
-                'geometry': gpd.GeoSeries.from_wkt([f'POLYGON((
-                    {x} {y},
-                    {x+grid_size_meters} {y},
-                    {x+grid_size_meters} {y+grid_size_meters},
-                    {x} {y+grid_size_meters},
-                    {x} {y}))'])[0],
-                'x': x,
-                'y': y
-            }
-            grid_cells.append(cell)
+    try:
+        for x in x_coords:
+            for y in y_coords:
+                # Define polygon coordinates
+                coords = [
+                    (x, y),
+                    (x + grid_size_meters, y),
+                    (x + grid_size_meters, y + grid_size_meters),
+                    (x, y + grid_size_meters),
+                    (x, y)
+                ]
+                # Create Polygon directly with shapely
+                polygon = Polygon(coords)
+                
+                grid_cells.append({
+                    'geometry': polygon,
+                    'x': x,
+                    'y': y
+                })
+    except Exception as e:
+        raise ValueError(f"Error creating grid cells: {str(e)}")
     
-    grid_gdf = gpd.GeoDataFrame(grid_cells, crs=utm_gdf.crs)
+    # Create GeoDataFrame with explicit geometry column
+    grid_gdf = gpd.GeoDataFrame(
+        grid_cells,
+        geometry='geometry',
+        crs=utm_gdf.crs
+    )
     joined = gpd.sjoin(utm_gdf, grid_gdf, how='left', predicate='within')
     
     selected_points = []
@@ -59,12 +73,10 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
     taken_cells = set()
     empty_cells = set()
     
-    # First pass: One tree per grid cell
     for idx, cell in grid_gdf.iterrows():
         cell_points = joined[joined['index_right'] == idx]
         
         if not cell_points.empty:
-            # Priority 1: Preferred species, class 1
             priority1 = cell_points[
                 (cell_points['Species'] == preferred_species) & 
                 (cell_points['Class'] == 1)
@@ -76,7 +88,6 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
                 taken_cells.add((cell['x'], cell['y']))
                 continue
             
-            # Priority 2: Preferred species, class 2
             priority2 = cell_points[
                 (cell_points['Species'] == preferred_species) & 
                 (cell_points['Class'] == 2)
@@ -90,16 +101,13 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
         else:
             empty_cells.add(idx)
     
-    # Second pass: Fill empty cells with adjacent trees or multiple from same cell
     for empty_idx in empty_cells:
         cell = grid_gdf.loc[empty_idx]
         adj_cells = get_adjacent_cells(cell['x'], cell['y'], grid_size_meters, taken_cells, grid_gdf)
         
-        # Try adjacent cells first
         for adj_idx in adj_cells:
             adj_points = joined[joined['index_right'] == adj_idx]
             
-            # Priority 1 in adjacent
             adj_p1 = adj_points[
                 (adj_points['Species'] == preferred_species) & 
                 (adj_points['Class'] == 1) &
@@ -112,7 +120,6 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
                 taken_cells.add((grid_gdf.loc[adj_idx, 'x'], grid_gdf.loc[adj_idx, 'y']))
                 break
                 
-            # Priority 2 in adjacent
             adj_p2 = adj_points[
                 (adj_points['Species'] == preferred_species) & 
                 (adj_points['Class'] == 2) &
@@ -125,10 +132,8 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
                 taken_cells.add((grid_gdf.loc[adj_idx, 'x'], grid_gdf.loc[adj_idx, 'y']))
                 break
         else:
-            # If no adjacent available, try multiple from nearby taken cells
             for adj_idx in adj_cells:
                 adj_points = joined[joined['index_right'] == adj_idx]
-                # Allow multiple from same cell now
                 multi_p1 = adj_points[
                     (adj_points['Species'] == preferred_species) & 
                     (adj_points['Class'] == 1) &
@@ -151,13 +156,11 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
                     taken_trees.add(point['geometry'])
                     break
     
-    # Third pass: Fill remaining with Class 3
     remaining_empty = set(grid_gdf.index) - set([p['index_right'] for p in selected_points])
     for empty_idx in remaining_empty:
         cell = grid_gdf.loc[empty_idx]
         cell_points = joined[joined['index_right'] == empty_idx]
         
-        # Try Class 3 in original cell
         class3 = cell_points[
             (cell_points['Species'] == preferred_species) & 
             (cell_points['Class'] == 3) &
@@ -170,7 +173,6 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
             taken_cells.add((cell['x'], cell['y']))
             continue
         
-        # Try adjacent cells for Class 3
         adj_cells = get_adjacent_cells(cell['x'], cell['y'], grid_size_meters, set(), grid_gdf)
         for adj_idx in adj_cells:
             adj_points = joined[joined['index_right'] == adj_idx]
@@ -186,7 +188,11 @@ def create_grid_and_select(gdf, grid_size_meters, preferred_species=None):
                 taken_cells.add((grid_gdf.loc[adj_idx, 'x'], grid_gdf.loc[adj_idx, 'y']))
                 break
 
-    selected_gdf = gpd.GeoDataFrame(selected_points)
+    selected_gdf = gpd.GeoDataFrame(
+        selected_points,
+        geometry='geometry',
+        crs=utm_gdf.crs
+    )
     return grid_gdf.to_crs("EPSG:4326"), selected_gdf.to_crs("EPSG:4326")
 
 def main():
@@ -292,4 +298,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
